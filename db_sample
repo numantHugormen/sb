@@ -1,0 +1,273 @@
+# Databricks notebook source
+from tmdl import TabularModel
+import json
+import requests
+from datetime import datetime
+import logging
+from typing import Dict, List, Optional
+
+# COMMAND ----------
+
+# Set up logging to work with Databricks
+def setup_logger():
+    logger = logging.getLogger('PowerBIDeployer')
+    logger.setLevel(logging.INFO)
+    
+    # Clear any existing handlers
+    if logger.handlers:
+        logger.handlers = []
+    
+    # Create handler that writes to Databricks notebook
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    
+    return logger
+
+logger = setup_logger()
+
+# COMMAND ----------
+
+class DatabricksConfig:
+    """Handle configuration and secrets management for Databricks"""
+    
+    def __init__(self, secret_scope: str = "power-bi"):
+        self.secret_scope = secret_scope
+        self._config = None
+        
+    def get_secret(self, key: str) -> str:
+        """Safely retrieve a secret from Databricks secret scope"""
+        try:
+            return dbutils.secrets.get(scope=self.secret_scope, key=key)
+        except Exception as e:
+            logger.error(f"Failed to retrieve secret {key}: {str(e)}")
+            raise
+    
+    @property
+    def config(self) -> Dict:
+        """Lazy load configuration from secrets and defaults"""
+        if self._config is None:
+            self._config = {
+                # Azure AD / Service Principal Configuration
+                'tenant_id': self.get_secret('tenant-id'),
+                'client_id': self.get_secret('client-id'),
+                'client_secret': self.get_secret('client-secret'),
+                
+                # Power BI Configuration
+                'workspace_name': self.get_secret('workspace-name'),
+                'dataset_name': self.get_secret('dataset-name'),
+                
+                # Construct server URL
+                'server': f"powerbi://api.powerbi.com/v1.0/myorg/{self.get_secret('workspace-name')}",
+                
+                # Model Configuration
+                'compatibility_level': 1500,
+                
+                # Azure AD Token Endpoint
+                'token_url': f"https://login.microsoftonline.com/{self.get_secret('tenant-id')}/oauth2/v2.0/token"
+            }
+        return self._config
+
+# COMMAND ----------
+
+class PowerBIDeployer:
+    def __init__(self, config: Dict):
+        self.config = config
+        self._access_token = None
+        self.logger = logging.getLogger('PowerBIDeployer')
+        
+    def get_access_token(self) -> str:
+        """Get Azure AD access token"""
+        self.logger.info("Getting access token...")
+        
+        token_data = {
+            'grant_type': 'client_credentials',
+            'client_id': self.config['client_id'],
+            'client_secret': self.config['client_secret'],
+            'scope': 'https://analysis.windows.net/powerbi/api/.default'
+        }
+        
+        try:
+            response = requests.post(self.config['token_url'], data=token_data)
+            response.raise_for_status()
+            
+            token_json = response.json()
+            self.logger.info("Successfully obtained access token")
+            return token_json['access_token']
+            
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Failed to get access token: {str(e)}")
+            raise
+    
+    def create_model(self, tables_config: List[Dict]) -> TabularModel:
+        """Create a tabular model from configuration"""
+        self.logger.info(f"Creating model: {self.config['dataset_name']}")
+        
+        try:
+            model = TabularModel(self.config['dataset_name'])
+            model.compatibility_level = self.config['compatibility_level']
+            
+            for table_config in tables_config:
+                self.logger.info(f"Adding table: {table_config['name']}")
+                table = model.add_table(table_config['name'])
+                
+                for column in table_config['columns']:
+                    self.logger.debug(f"Adding column: {column['name']}")
+                    table.add_column(
+                        name=column['name'],
+                        data_type=column['dataType'],
+                        source_column=column.get('sourceColumn', column['name'])
+                    )
+            
+            return model
+            
+        except Exception as e:
+            self.logger.error(f"Failed to create model: {str(e)}")
+            raise
+    
+    def deploy_model(self, model: TabularModel) -> str:
+        """Deploy the model to Power BI"""
+        self.logger.info("Preparing model deployment...")
+        
+        # Get TMSL representation
+        tmsl = model.to_tmsl()
+        
+        deployment_tmsl = {
+            "createOrReplace": {
+                "object": {
+                    "database": self.config['dataset_name']
+                },
+                "database": tmsl
+            }
+        }
+        
+        # Get fresh token and prepare headers
+        self._access_token = self.get_access_token()
+        headers = {
+            'Authorization': f'Bearer {self._access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Construct XMLA endpoint URL
+        xmla_endpoint = f"{self.config['server'].replace('powerbi://', 'https://')}/xmla"
+        
+        try:
+            self.logger.info(f"Deploying to endpoint: {xmla_endpoint}")
+            response = requests.post(
+                xmla_endpoint,
+                headers=headers,
+                json=deployment_tmsl
+            )
+            response.raise_for_status()
+            
+            self.logger.info("Model deployed successfully")
+            return "Model deployed successfully"
+            
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Deployment failed: {str(e)}")
+            if response.text:
+                self.logger.error(f"Response: {response.text}")
+            raise
+
+# COMMAND ----------
+
+def load_table_config_from_delta(delta_table_path: str) -> List[Dict]:
+    """Load table configuration from a Delta table"""
+    try:
+        # Read the Delta table into a DataFrame
+        df = spark.read.format("delta").load(delta_table_path)
+        
+        # Convert to dictionary format needed for model creation
+        tables_config = []
+        
+        # Get schema information
+        schema = df.schema
+        
+        # Create table configuration
+        table_config = {
+            "name": delta_table_path.split('/')[-1],  # Use last part of path as table name
+            "columns": []
+        }
+        
+        # Map Spark types to Power BI types
+        type_mapping = {
+            'StringType': 'string',
+            'IntegerType': 'int64',
+            'LongType': 'int64',
+            'DoubleType': 'double',
+            'DecimalType': 'decimal',
+            'DateType': 'datetime',
+            'TimestampType': 'datetime',
+            'BooleanType': 'boolean'
+        }
+        
+        # Add columns
+        for field in schema.fields:
+            column_type = type_mapping.get(field.dataType.__class__.__name__, 'string')
+            table_config["columns"].append({
+                "name": field.name,
+                "dataType": column_type,
+                "sourceColumn": field.name
+            })
+        
+        tables_config.append(table_config)
+        return tables_config
+        
+    except Exception as e:
+        logger.error(f"Failed to load table config from Delta: {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def main(delta_table_path: Optional[str] = None):
+    """Main execution function"""
+    try:
+        logger.info("Starting Power BI deployment process")
+        
+        # Initialize configuration
+        config = DatabricksConfig().config
+        
+        # Create deployer instance
+        deployer = PowerBIDeployer(config)
+        
+        # Load table configuration
+        if delta_table_path:
+            logger.info(f"Loading configuration from Delta table: {delta_table_path}")
+            tables_config = load_table_config_from_delta(delta_table_path)
+        else:
+            # Use sample configuration
+            tables_config = [
+                {
+                    "name": "Table1",
+                    "columns": [
+                        {
+                            "name": "Column1",
+                            "dataType": "string",
+                            "sourceColumn": "Column1"
+                        }
+                    ]
+                }
+            ]
+        
+        # Create and deploy model
+        model = deployer.create_model(tables_config)
+        result = deployer.deploy_model(model)
+        
+        logger.info("Deployment completed successfully")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Deployment failed: {str(e)}")
+        raise
+
+# COMMAND ----------
+
+# Example usage
+if __name__ == "__main__":
+    # To run with sample configuration:
+    # main()
+    
+    # To run with Delta table:
+    # main("/path/to/your/delta/table")
+    pass
