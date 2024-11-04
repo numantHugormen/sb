@@ -1,86 +1,204 @@
-import requests
-from requests_negotiate_sspi import HttpNegotiateAuth
+%pip install semantic-link
+
+# Import required libraries
+import sempy
+import sempy.fabric as fabric
+import pandas as pd
+from typing import Optional, Dict, Any
 import json
 
-# Configuration
-tenant_id = ""
-client_id = ""
-client_secret = ""
-power_bi_dataset_url = ""
-xmla_endpoint = ""
+def connect_to_workspace(workspace_name: str) -> str:
+    """
+    Connects to a specific Power BI workspace.
+    
+    Parameters:
+    - workspace_name: Name of the workspace to connect to
+    
+    Returns:
+    - workspace_id: ID of the connected workspace
+    """
+    try:
+        workspace_id = fabric.resolve_workspace_id(workspace_name)
+        if workspace_id:
+            print(f"Successfully connected to workspace: {workspace_name}")
+            return workspace_id
+        else:
+            print(f"Workspace '{workspace_name}' not found.")
+            return None
+    except Exception as e:
+        print(f"Error connecting to workspace: {str(e)}")
+        return None
 
-# Step 1: Authenticate and get access token
-def get_access_token():
-    url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "scope": "https://analysis.windows.net/powerbi/api/.default"
-    }
-    response = requests.post(url, data=data)
-    return response.json()["access_token"]
+def create_semantic_model(model_name: str, 
+                        workspace_name: str,
+                        compatibility_level: int = 1604,
+                        tables: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    Creates a new semantic model in the specified workspace.
+    
+    Parameters:
+    - model_name: Name of the semantic model to create
+    - workspace_name: Name of the workspace
+    - compatibility_level: Compatibility level of the model (default: 1604)
+    - tables: Optional dictionary containing table definitions
+    
+    Returns:
+    - bool: True if successful, False otherwise
+    """
+    try:
+        # Basic TMSL template for creating a semantic model
+        tmsl = {
+            "createOrReplace": {
+                "object": {
+                    "database": model_name
+                },
+                "database": {
+                    "name": model_name,
+                    "compatibilityLevel": compatibility_level,
+                    "model": {
+                        "culture": "en-US",
+                        "defaultPowerBIDataSourceVersion": "powerBI_V3",
+                        "tables": tables if tables else []
+                    }
+                }
+            }
+        }
 
-access_token = get_access_token()
-print(f"Access token: {access_token[:50]}...")  # Print first 50 characters for verification
+        # Execute TMSL
+        result = fabric.execute_tmsl(
+            script=json.dumps(tmsl),
+            workspace=workspace_name
+        )
 
-# Step 2: Establish XMLA connection
-def create_xmla_connection():
-    auth = HttpNegotiateAuth()
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-    return requests.Session(), headers, auth
+        print(f"\nSemantic model '{model_name}' created successfully in workspace '{workspace_name}'")
+        return True
 
-session, headers, auth = create_xmla_connection()
-# print(session, headers, auth)
+    except Exception as e:
+        print(f"Error creating semantic model: {str(e)}")
+        return False
 
-# # Step 3: Publish a new semantic model
-# def publish_semantic_model(model_name, model_definition):
-#     # issue requests cannot form a connection starting with powerbi://
-#     url = f"{xmla_endpoint}/datasets/{model_name}"
-#     # old url = f"{xmla_endpoint}/databases/{model_name}"
-#     response = session.post(url, headers=headers, auth=auth, json=model_definition)
-#     if response.status_code == 200:
-#         print(f"Semantic model '{model_name}' published successfully.")
-#     else:
-#         print(f"Failed to publish semantic model. Status code: {response.status_code}")
-#         print(response.text)
+def deploy_direct_lake_model(model_name: str,
+                           workspace_name: str,
+                           lakehouse_name: str,
+                           tables: Dict[str, str]) -> bool:
+    """
+    Deploys a Direct Lake semantic model connecting to specified lakehouse tables.
+    
+    Parameters:
+    - model_name: Name of the semantic model to create
+    - workspace_name: Name of the workspace
+    - lakehouse_name: Name of the lakehouse
+    - tables: Dictionary of table names and their corresponding lakehouse paths
+    
+    Returns:
+    - bool: True if successful, False otherwise
+    """
+    try:
+        # Get workspace and lakehouse IDs
+        workspace_id = fabric.resolve_workspace_id(workspace_name)
+        
+        # Get lakehouse information
+        lakehouse_items = fabric.list_items()
+        lakehouse_info = lakehouse_items[
+            (lakehouse_items['Display Name'] == lakehouse_name) & 
+            (lakehouse_items['Type'] == 'Lakehouse')
+        ]
+        
+        if lakehouse_info.empty:
+            print(f"Lakehouse '{lakehouse_name}' not found.")
+            return False
+            
+        lakehouse_id = lakehouse_info['Id'].iloc[0]
+        
+        # Create table definitions for Direct Lake
+        table_definitions = []
+        for table_name, table_path in tables.items():
+            table_def = {
+                "name": table_name,
+                "mode": "directLake",
+                "source": {
+                    "type": "entity",
+                    "expression": f"Lakehouse.'{table_path}'"
+                }
+            }
+            table_definitions.append(table_def)
+        
+        # Create the semantic model
+        success = create_semantic_model(
+            model_name=model_name,
+            workspace_name=workspace_name,
+            tables=table_definitions
+        )
+        
+        return success
 
-# # Example usage:
-# model_definition = {
-#     "name": "NewModel",
-#     "tables": [
-#         {
-#             "name": "Table1",
-#             "columns": [
-#                 {"name": "Column1", "dataType": "string"},
-#                 {"name": "Column2", "dataType": "int64"}
-#             ]
-#         }
-#     ]
-# }
-# publish_semantic_model("NewModel", model_definition)
+    except Exception as e:
+        print(f"Error deploying Direct Lake model: {str(e)}")
+        return False
 
-# # Step 4: Push data to existing dataset
-# def push_data_to_dataset(dataset_id, table_name, rows):
-#     url = f"{power_bi_dataset_url}/{dataset_id}/tables/{table_name}/rows"
-#     data = json.dumps({"rows": rows})
-#     response = requests.post(url, headers=headers, data=data)
-#     if response.status_code == 200:
-#         print(f"Data pushed to dataset '{dataset_id}' table '{table_name}' successfully.")
-#     else:
-#         print(f"Failed to push data. Status code: {response.status_code}")
-#         print(response.text)
+def verify_deployment(model_name: str, workspace_name: str) -> bool:
+    """
+    Verifies that a semantic model was deployed successfully.
+    
+    Parameters:
+    - model_name: Name of the semantic model
+    - workspace_name: Name of the workspace
+    
+    Returns:
+    - bool: True if model exists and is accessible
+    """
+    try:
+        datasets = fabric.list_datasets(workspace=workspace_name)
+        if model_name in datasets['Dataset Name'].values:
+            print(f"Verified: Semantic model '{model_name}' exists and is accessible.")
+            
+            # Get and display model properties
+            model_info = datasets[datasets['Dataset Name'] == model_name]
+            print("\nModel Properties:")
+            display(model_info)
+            
+            return True
+        else:
+            print(f"Semantic model '{model_name}' not found in workspace.")
+            return False
+            
+    except Exception as e:
+        print(f"Error verifying deployment: {str(e)}")
+        return False
 
 # Example usage:
-# dataset_id = "your_dataset_id"
-# table_name = "YourTableName"
-# rows = [
-#     {"Column1": "Value1", "Column2": 42},
-#     {"Column1": "Value2", "Column2": 73}
-# ]
-# Uncomment the line below to push data to the dataset
-# push_data_to_dataset(dataset_id, table_name, rows)
-# publish_semantic_model("NewModel", model_definition)
+
+# 1. Deploy a basic semantic model
+"""
+workspace_name = "Your Workspace Name"
+model_name = "Your Model Name"
+
+create_semantic_model(
+    model_name=model_name,
+    workspace_name=workspace_name
+)
+"""
+
+# 2. Deploy a Direct Lake semantic model
+"""
+workspace_name = "Your Workspace Name"
+model_name = "Your Model Name"
+lakehouse_name = "Your Lakehouse Name"
+
+# Define tables to include in the model
+tables = {
+    "Sales": "Tables/sales",
+    "Products": "Tables/products",
+    "Customers": "Tables/customers"
+}
+
+deploy_direct_lake_model(
+    model_name=model_name,
+    workspace_name=workspace_name,
+    lakehouse_name=lakehouse_name,
+    tables=tables
+)
+
+# Verify deployment
+verify_deployment(model_name, workspace_name)
+"""
