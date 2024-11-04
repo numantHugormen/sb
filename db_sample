@@ -1,273 +1,148 @@
-# Databricks notebook source
-from tmdl import TabularModel
-import json
-import requests
-from datetime import datetime
-import logging
-from typing import Dict, List, Optional
 
-# COMMAND ----------
+# Import required libraries
+import sempy
+import sempy.fabric as fabric
+import pandas as pd
+from typing import Optional
 
-# Set up logging to work with Databricks
-def setup_logger():
-    logger = logging.getLogger('PowerBIDeployer')
-    logger.setLevel(logging.INFO)
+def connect_to_workspace(workspace_name: str) -> str:
+    """
+    Connects to a specific Power BI workspace using XMLA endpoint.
     
-    # Clear any existing handlers
-    if logger.handlers:
-        logger.handlers = []
+    Parameters:
+    - workspace_name: Name of the workspace to connect to
     
-    # Create handler that writes to Databricks notebook
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    
-    return logger
-
-logger = setup_logger()
-
-# COMMAND ----------
-
-class DatabricksConfig:
-    """Handle configuration and secrets management for Databricks"""
-    
-    def __init__(self, secret_scope: str = "power-bi"):
-        self.secret_scope = secret_scope
-        self._config = None
-        
-    def get_secret(self, key: str) -> str:
-        """Safely retrieve a secret from Databricks secret scope"""
-        try:
-            return dbutils.secrets.get(scope=self.secret_scope, key=key)
-        except Exception as e:
-            logger.error(f"Failed to retrieve secret {key}: {str(e)}")
-            raise
-    
-    @property
-    def config(self) -> Dict:
-        """Lazy load configuration from secrets and defaults"""
-        if self._config is None:
-            self._config = {
-                # Azure AD / Service Principal Configuration
-                'tenant_id': self.get_secret('tenant-id'),
-                'client_id': self.get_secret('client-id'),
-                'client_secret': self.get_secret('client-secret'),
-                
-                # Power BI Configuration
-                'workspace_name': self.get_secret('workspace-name'),
-                'dataset_name': self.get_secret('dataset-name'),
-                
-                # Construct server URL
-                'server': f"powerbi://api.powerbi.com/v1.0/myorg/{self.get_secret('workspace-name')}",
-                
-                # Model Configuration
-                'compatibility_level': 1500,
-                
-                # Azure AD Token Endpoint
-                'token_url': f"https://login.microsoftonline.com/{self.get_secret('tenant-id')}/oauth2/v2.0/token"
-            }
-        return self._config
-
-# COMMAND ----------
-
-class PowerBIDeployer:
-    def __init__(self, config: Dict):
-        self.config = config
-        self._access_token = None
-        self.logger = logging.getLogger('PowerBIDeployer')
-        
-    def get_access_token(self) -> str:
-        """Get Azure AD access token"""
-        self.logger.info("Getting access token...")
-        
-        token_data = {
-            'grant_type': 'client_credentials',
-            'client_id': self.config['client_id'],
-            'client_secret': self.config['client_secret'],
-            'scope': 'https://analysis.windows.net/powerbi/api/.default'
-        }
-        
-        try:
-            response = requests.post(self.config['token_url'], data=token_data)
-            response.raise_for_status()
-            
-            token_json = response.json()
-            self.logger.info("Successfully obtained access token")
-            return token_json['access_token']
-            
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Failed to get access token: {str(e)}")
-            raise
-    
-    def create_model(self, tables_config: List[Dict]) -> TabularModel:
-        """Create a tabular model from configuration"""
-        self.logger.info(f"Creating model: {self.config['dataset_name']}")
-        
-        try:
-            model = TabularModel(self.config['dataset_name'])
-            model.compatibility_level = self.config['compatibility_level']
-            
-            for table_config in tables_config:
-                self.logger.info(f"Adding table: {table_config['name']}")
-                table = model.add_table(table_config['name'])
-                
-                for column in table_config['columns']:
-                    self.logger.debug(f"Adding column: {column['name']}")
-                    table.add_column(
-                        name=column['name'],
-                        data_type=column['dataType'],
-                        source_column=column.get('sourceColumn', column['name'])
-                    )
-            
-            return model
-            
-        except Exception as e:
-            self.logger.error(f"Failed to create model: {str(e)}")
-            raise
-    
-    def deploy_model(self, model: TabularModel) -> str:
-        """Deploy the model to Power BI"""
-        self.logger.info("Preparing model deployment...")
-        
-        # Get TMSL representation
-        tmsl = model.to_tmsl()
-        
-        deployment_tmsl = {
-            "createOrReplace": {
-                "object": {
-                    "database": self.config['dataset_name']
-                },
-                "database": tmsl
-            }
-        }
-        
-        # Get fresh token and prepare headers
-        self._access_token = self.get_access_token()
-        headers = {
-            'Authorization': f'Bearer {self._access_token}',
-            'Content-Type': 'application/json'
-        }
-        
-        # Construct XMLA endpoint URL
-        xmla_endpoint = f"{self.config['server'].replace('powerbi://', 'https://')}/xmla"
-        
-        try:
-            self.logger.info(f"Deploying to endpoint: {xmla_endpoint}")
-            response = requests.post(
-                xmla_endpoint,
-                headers=headers,
-                json=deployment_tmsl
-            )
-            response.raise_for_status()
-            
-            self.logger.info("Model deployed successfully")
-            return "Model deployed successfully"
-            
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Deployment failed: {str(e)}")
-            if response.text:
-                self.logger.error(f"Response: {response.text}")
-            raise
-
-# COMMAND ----------
-
-def load_table_config_from_delta(delta_table_path: str) -> List[Dict]:
-    """Load table configuration from a Delta table"""
+    Returns:
+    - workspace_id: ID of the connected workspace
+    """
     try:
-        # Read the Delta table into a DataFrame
-        df = spark.read.format("delta").load(delta_table_path)
+        # Get workspace ID from name
+        workspace_id = fabric.resolve_workspace_id(workspace_name)
         
-        # Convert to dictionary format needed for model creation
-        tables_config = []
-        
-        # Get schema information
-        schema = df.schema
-        
-        # Create table configuration
-        table_config = {
-            "name": delta_table_path.split('/')[-1],  # Use last part of path as table name
-            "columns": []
-        }
-        
-        # Map Spark types to Power BI types
-        type_mapping = {
-            'StringType': 'string',
-            'IntegerType': 'int64',
-            'LongType': 'int64',
-            'DoubleType': 'double',
-            'DecimalType': 'decimal',
-            'DateType': 'datetime',
-            'TimestampType': 'datetime',
-            'BooleanType': 'boolean'
-        }
-        
-        # Add columns
-        for field in schema.fields:
-            column_type = type_mapping.get(field.dataType.__class__.__name__, 'string')
-            table_config["columns"].append({
-                "name": field.name,
-                "dataType": column_type,
-                "sourceColumn": field.name
-            })
-        
-        tables_config.append(table_config)
-        return tables_config
-        
-    except Exception as e:
-        logger.error(f"Failed to load table config from Delta: {str(e)}")
-        raise
-
-# COMMAND ----------
-
-def main(delta_table_path: Optional[str] = None):
-    """Main execution function"""
-    try:
-        logger.info("Starting Power BI deployment process")
-        
-        # Initialize configuration
-        config = DatabricksConfig().config
-        
-        # Create deployer instance
-        deployer = PowerBIDeployer(config)
-        
-        # Load table configuration
-        if delta_table_path:
-            logger.info(f"Loading configuration from Delta table: {delta_table_path}")
-            tables_config = load_table_config_from_delta(delta_table_path)
+        if workspace_id:
+            print(f"Successfully connected to workspace: {workspace_name}")
+            return workspace_id
         else:
-            # Use sample configuration
-            tables_config = [
-                {
-                    "name": "Table1",
-                    "columns": [
-                        {
-                            "name": "Column1",
-                            "dataType": "string",
-                            "sourceColumn": "Column1"
-                        }
-                    ]
-                }
+            print(f"Workspace '{workspace_name}' not found.")
+            return None
+            
+    except Exception as e:
+        print(f"Error connecting to workspace: {str(e)}")
+        return None
+
+def list_datasets_with_properties(workspace_name: Optional[str] = None):
+    """
+    Lists all datasets in the specified workspace with additional properties.
+    
+    Parameters:
+    - workspace_name: Optional name of the workspace. If None, uses current workspace.
+    
+    Returns:
+    - pandas DataFrame with dataset information
+    """
+    try:
+        # Get datasets with additional properties
+        datasets = fabric.list_datasets(
+            workspace=workspace_name,
+            additional_xmla_properties=[
+                'Model.DefaultMode',
+                'Model.DirectLakeBehavior',
+                'CompatibilityLevel'
             ]
+        )
         
-        # Create and deploy model
-        model = deployer.create_model(tables_config)
-        result = deployer.deploy_model(model)
+        # Sort datasets by name for better readability
+        datasets = datasets.sort_values(by='Dataset Name', ascending=True)
         
-        logger.info("Deployment completed successfully")
-        return result
+        if not datasets.empty:
+            print(f"\nFound {len(datasets)} datasets in workspace: {workspace_name or 'current workspace'}\n")
+            return datasets
+        else:
+            print(f"No datasets found in workspace: {workspace_name or 'current workspace'}")
+            return None
+            
+    except Exception as e:
+        print(f"Error occurred while listing datasets: {str(e)}")
+        return None
+
+def refresh_single_dataset(dataset_name: str, workspace_name: Optional[str] = None):
+    """
+    Refreshes a single dataset in the specified workspace.
+    
+    Parameters:
+    - dataset_name: Name of the dataset to refresh
+    - workspace_name: Optional name of the workspace. If None, uses current workspace.
+    """
+    try:
+        # Connect to workspace if specified
+        if workspace_name:
+            workspace_id = connect_to_workspace(workspace_name)
+            if not workspace_id:
+                return
+                
+        # Verify dataset exists
+        datasets = fabric.list_datasets(workspace=workspace_name)
+        if dataset_name not in datasets['Dataset Name'].values:
+            print(f"Dataset '{dataset_name}' not found in workspace: {workspace_name or 'current workspace'}")
+            return
+        
+        print(f"\nStarting refresh for dataset: {dataset_name}")
+        print(f"Workspace: {workspace_name or 'current workspace'}")
+        
+        # Initiate full refresh
+        fabric.refresh_dataset(
+            dataset=dataset_name,
+            workspace=workspace_name,
+            refresh_type='full'
+        )
+        
+        # Get refresh status
+        refresh_status = fabric.list_refresh_requests(
+            dataset=dataset_name,
+            workspace=workspace_name
+        )
+        
+        print("\nRefresh Status:")
+        display(refresh_status)
         
     except Exception as e:
-        logger.error(f"Deployment failed: {str(e)}")
-        raise
+        print(f"Error refreshing dataset: {str(e)}")
 
-# COMMAND ----------
-
-# Example usage
-if __name__ == "__main__":
-    # To run with sample configuration:
-    # main()
+def get_refresh_status(dataset_name: str, workspace_name: Optional[str] = None):
+    """
+    Gets the current refresh status for a dataset.
     
-    # To run with Delta table:
-    # main("/path/to/your/delta/table")
-    pass
+    Parameters:
+    - dataset_name: Name of the dataset
+    - workspace_name: Optional name of the workspace. If None, uses current workspace.
+    """
+    try:
+        refresh_status = fabric.list_refresh_requests(
+            dataset=dataset_name,
+            workspace=workspace_name
+        )
+        
+        print(f"\nCurrent refresh status for dataset: {dataset_name}")
+        print(f"Workspace: {workspace_name or 'current workspace'}\n")
+        display(refresh_status)
+        
+    except Exception as e:
+        print(f"Error getting refresh status: {str(e)}")
+
+# Example usage:
+
+# 1. Connect to a specific workspace
+workspace_name = "powerbi://api.powerbi.com/v1.0/myorg/"
+connect_to_workspace(workspace_name)
+
+
+# 2. List all datasets in the workspace
+datasets = list_datasets_with_properties(workspace_name)
+if datasets is not None:
+    display(datasets)
+
+# 3. Refresh a specific dataset
+# refresh_single_dataset("Your Dataset Name", workspace_name)
+
+# 4. Check refresh status
+# get_refresh_status("Your Dataset Name", workspace_name)
