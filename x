@@ -28,7 +28,7 @@ def validate_file_extension(file_path: str) -> bool:
         return False
     return True
 
-async def load_tmsl_from_file(file_path: str) -> dict:
+def load_tmsl_from_file(file_path: str) -> dict:
     """
     Loads TMSL from a file and validates its JSON structure.
     
@@ -43,8 +43,9 @@ async def load_tmsl_from_file(file_path: str) -> dict:
         if not validate_file_extension(file_path):
             return None
             
-        # Read the file content using window.fs.readFile
-        file_content = await window.fs.readFile(file_path, { 'encoding': 'utf8' })
+        # Read the file content using regular Python file operations
+        with open(file_path, 'r', encoding='utf-8') as file:
+            file_content = file.read()
         
         # Parse and validate JSON
         tmsl_content = json.loads(file_content)
@@ -65,9 +66,9 @@ async def load_tmsl_from_file(file_path: str) -> dict:
         print(f"Error loading TMSL file: {str(e)}")
         return None
 
-async def deploy_semantic_model_from_tmsl(workspace_name: str, 
-                                        tmsl_file_path: str,
-                                        parameters: Optional[Dict[str, str]] = None) -> bool:
+def deploy_semantic_model_from_tmsl(workspace_name: str, 
+                                  tmsl_file_path: str,
+                                  parameters: Optional[Dict[str, str]] = None) -> bool:
     """
     Deploys a semantic model using TMSL from a file.
     
@@ -81,7 +82,7 @@ async def deploy_semantic_model_from_tmsl(workspace_name: str,
     """
     try:
         # Load TMSL from file
-        tmsl_content = await load_tmsl_from_file(tmsl_file_path)
+        tmsl_content = load_tmsl_from_file(tmsl_file_path)
         if not tmsl_content:
             return False
             
@@ -137,42 +138,34 @@ def verify_deployment(model_name: str, workspace_name: str) -> bool:
 
 # Example usage:
 
-# 1. Using .tmsl extension
+# 1. Basic deployment from TMSL file
 """
 workspace_name = "Your Workspace Name"
 tmsl_file_path = "path/to/your/model.tmsl"
 
-# Since we're using async functions, we need to use await
-async def deploy_model():
-    await deploy_semantic_model_from_tmsl(
-        workspace_name=workspace_name,
-        tmsl_file_path=tmsl_file_path
-    )
-
-# Run the async function
-await deploy_model()
+deploy_semantic_model_from_tmsl(
+    workspace_name=workspace_name,
+    tmsl_file_path=tmsl_file_path
+)
 """
 
-# 2. Using .json extension with parameters
+# 2. Deployment with parameter substitution
 """
 workspace_name = "Your Workspace Name"
 tmsl_file_path = "path/to/your/model.json"
 
+# Parameters to replace in the TMSL
 parameters = {
     "ModelName": "Sales Analysis",
     "LakehousePath": "Tables/sales",
     "CompatibilityLevel": "1566"
 }
 
-async def deploy_model_with_params():
-    await deploy_semantic_model_from_tmsl(
-        workspace_name=workspace_name,
-        tmsl_file_path=tmsl_file_path,
-        parameters=parameters
-    )
-
-# Run the async function
-await deploy_model_with_params()
+deploy_semantic_model_from_tmsl(
+    workspace_name=workspace_name,
+    tmsl_file_path=tmsl_file_path,
+    parameters=parameters
+)
 
 # Verify the deployment
 verify_deployment("Sales Analysis", workspace_name)
